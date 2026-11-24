@@ -1,0 +1,73 @@
+# ESAP+ push reminders that only call the app's database and Edge Function
+# (no code is checked out):
+# - Achados e Perdidos: items about to be archived (school mornings);
+# - Biblioteca: loans due soon or late (school mornings);
+# - Notificações push: tomorrow's tests (school evenings).
+# Calling any of them twice sends nothing twice.
+#
+# Secrets: SUPABASE_ACCESS_TOKEN, SUPABASE_PROJECT_ID, SUPABASE_STAGING_PROJECT_ID.
+name: Avisos
+
+on:
+  schedule:
+    - cron: '7 8 * * 1-5'   # achados-perdidos
+    - cron: '17 8 * * 1-5'  # biblioteca
+    # 18:00 in Lisbon in summer, 17:00 in winter; Sunday to Thursday
+    - cron: '0 17 * * 0-4'  # testes de amanhã
+  workflow_dispatch:
+    inputs:
+      qual:
+        description: Que avisos enviar
+        type: choice
+        options: [achados-perdidos, biblioteca, testes]
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  avisos:
+    name: Avisos
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    strategy:
+      fail-fast: false
+      matrix:
+        project: [SUPABASE_PROJECT_ID, SUPABASE_STAGING_PROJECT_ID]
+    env:
+      QUAL: >-
+        ${{ inputs.qual
+          || (github.event.schedule == '7 8 * * 1-5' && 'achados-perdidos')
+          || (github.event.schedule == '17 8 * * 1-5' && 'biblioteca')
+          || 'testes' }}
+      SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+      REF: ${{ secrets[matrix.project] }}
+    steps:
+      - name: Queue the warnings
+        if: env.QUAL != 'testes'
+        run: |
+          case "$QUAL" in
+            achados-perdidos) fn=achados_perdidos_avisar_arquivo ;;
+            biblioteca) fn=biblioteca_avisar_prazos ;;
+          esac
+          curl -sS --fail-with-body -X POST \
+            -H "Authorization: Bearer $SUPABASE_ACCESS_TOKEN" -H 'Content-Type: application/json' \
+            -d "{\"query\":\"select public.$fn() as avisos\"}" \
+            "https://api.supabase.com/v1/projects/$REF/database/query"
+      - name: Send them
+        run: |
+          body='{}'
+          if [ "$QUAL" = testes ]; then body='{"lembretes":true}'; fi
+          curl -sS --fail-with-body -X POST \
+            -H 'Content-Type: application/json' -d "$body" \
+            "https://$REF.supabase.co/functions/v1/notificacoes-push"
+
+  keep:
+    name: Keep the schedule on
+    if: ${{ !cancelled() && github.event_name == 'schedule' }}
+    needs: avisos
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/avisos.yml/enable"

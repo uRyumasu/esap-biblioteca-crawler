@@ -1,0 +1,71 @@
+# ESAP+ "cantina": reads the menu PDF from esap.edu.pt into the app's
+# production and staging databases. The code stays in the private app
+# repository: this only checks it out (ESAP_PLUS_TOKEN) and runs
+# scripts/cantina there, because Actions minutes are free in a public repo.
+#
+# Secrets: ESAP_PLUS_TOKEN, SUPABASE_ACCESS_TOKEN, SUPABASE_PROJECT_ID,
+# SUPABASE_STAGING_PROJECT_ID (see README.md).
+name: Cantina
+
+on:
+  schedule:
+    - cron: '17 5 * * *'
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Ler outra vez mesmo os PDFs já lidos
+        type: boolean
+        default: false
+      link:
+        description: Link do PDF da ementa (Google Drive), se o site não o mostrar
+        type: string
+        default: ''
+
+concurrency:
+  group: cantina
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  fetch:
+    name: Ementa da cantina
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: uRyumasu/esap-plus
+          token: ${{ secrets.ESAP_PLUS_TOKEN }}
+          persist-credentials: false
+      - name: Tesseract (Portuguese), pdftoppm, pillow, numpy
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq tesseract-ocr tesseract-ocr-por poppler-utils python3-pil python3-numpy
+
+      - name: Read new menus into the databases
+        shell: bash
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          CANTINA_PROJECTS: ${{ secrets.SUPABASE_PROJECT_ID }},${{ secrets.SUPABASE_STAGING_PROJECT_ID }}
+          FORCE: ${{ inputs.force && '--force' || '' }}
+          LINK: ${{ inputs.link }}
+        run: python3 scripts/cantina/fetch.py $FORCE ${LINK:+--url "$LINK"} > /tmp/cantina.json
+
+      # Administração → Estado dos dados (never fails the run)
+      - name: Data status
+        if: ${{ !cancelled() }}
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          ESTADO_PROJECTS: ${{ secrets.SUPABASE_PROJECT_ID }},${{ secrets.SUPABASE_STAGING_PROJECT_ID }}
+        run: node scripts/estado-dados/registar.mjs cantina ${{ job.status }} /tmp/cantina.json
+
+      # GitHub turns off the schedule of a public repository after 60 days
+      # without commits; enabling the workflow again keeps it on.
+      - name: Keep the schedule on
+        if: ${{ !cancelled() && github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/cantina.yml/enable"
