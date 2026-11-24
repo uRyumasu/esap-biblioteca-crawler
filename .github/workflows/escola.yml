@@ -1,0 +1,58 @@
+# ESAP+ "escola": reads the class directors' PDF from esap.edu.pt into the
+# app's production and staging databases. The code stays in the private app
+# repository: this only checks it out (ESAP_PLUS_TOKEN) and runs
+# scripts/escola there.
+#
+# Secrets: ESAP_PLUS_TOKEN, SUPABASE_ACCESS_TOKEN, SUPABASE_PROJECT_ID,
+# SUPABASE_STAGING_PROJECT_ID (see README.md).
+name: Escola
+
+on:
+  schedule:
+    - cron: '23 5 * * 1'
+  workflow_dispatch:
+
+concurrency:
+  group: escola
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  fetch:
+    name: Diretores de turma
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: uRyumasu/esap-plus
+          token: ${{ secrets.ESAP_PLUS_TOKEN }}
+          persist-credentials: false
+      - name: pdftotext
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq poppler-utils
+
+      - name: Read the class directors into the databases
+        shell: bash
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          ESCOLA_PROJECTS: ${{ secrets.SUPABASE_PROJECT_ID }},${{ secrets.SUPABASE_STAGING_PROJECT_ID }}
+        run: python3 scripts/escola/diretores.py > /tmp/escola.json
+
+      # Administração → Estado dos dados (never fails the run)
+      - name: Data status
+        if: ${{ !cancelled() }}
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          ESTADO_PROJECTS: ${{ secrets.SUPABASE_PROJECT_ID }},${{ secrets.SUPABASE_STAGING_PROJECT_ID }}
+        run: node scripts/estado-dados/registar.mjs diretores ${{ job.status }} /tmp/escola.json
+
+      - name: Keep the schedule on
+        if: ${{ !cancelled() && github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/escola.yml/enable"

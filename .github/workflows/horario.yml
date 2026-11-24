@@ -1,0 +1,108 @@
+# ESAP+ "horario": keeps the class timetables (horarios.json, shipped with the
+# app) up to date with the Untis PDFs on esap.edu.pt. The code stays in the
+# private app repository: this checks it out (ESAP_PLUS_TOKEN) and runs
+# scripts/horario there.
+#
+# - every school morning: if a PDF changed, open (or update) a PR on
+#   fix/horario-dados in uRyumasu/esap-plus. Merging it is a normal deploy;
+# - every school day: save what changed in the last merged version in
+#   public.horario_mudancas (a trigger notifies each class). Each change has a
+#   key, so running this every day saves and notifies nothing twice.
+#
+# Secrets: ESAP_PLUS_TOKEN, SUPABASE_ACCESS_TOKEN, SUPABASE_PROJECT_ID,
+# SUPABASE_STAGING_PROJECT_ID (see README.md).
+name: Horário
+
+on:
+  schedule:
+    - cron: '41 5 * * 1-5'   # new PDFs
+    - cron: '11 7-17/2 * * 1-5' # changes of a merged version
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Ler outra vez mesmo que os PDFs não tenham mudado
+        type: boolean
+        default: false
+
+concurrency:
+  group: horario
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  actions: write
+
+jobs:
+  update:
+    name: Horários novos
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '41 5 * * 1-5'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: uRyumasu/esap-plus
+          token: ${{ secrets.ESAP_PLUS_TOKEN }}
+      - run: pip install --quiet pdfplumber==0.11.10
+
+      - name: Read the PDFs
+        id: fetch
+        run: python3 scripts/horario/fetch.py --resumo /tmp/horario.md ${{ inputs.force && '--force' || '' }}
+
+      - name: Open or update the PR
+        if: steps.fetch.outputs.mudou == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.ESAP_PLUS_TOKEN }}
+          GH_REPO: uRyumasu/esap-plus
+          BRANCH: fix/horario-dados
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git switch -c "$BRANCH"
+          git add web/src/features/salas-livres/dados/horarios.json scripts/horario/fontes.json
+          git commit -q -m "fix(horario): horários da escola de $(jq -r .atualizado web/src/features/salas-livres/dados/horarios.json)"
+          git push -f origin "$BRANCH"
+          {
+            echo 'Horários novos no site da escola, lidos por `uRyumasu/esap-biblioteca-crawler` (`.github/workflows/horario.yml`).'
+            echo
+            cat /tmp/horario.md
+            echo
+            echo 'Ao juntar, os alunos de cada turma veem as mudanças no Horário e recebem uma notificação.'
+          } > /tmp/body.md
+          if [ -n "$(gh pr list --head "$BRANCH" --state open --json number --jq '.[].number')" ]; then
+            gh pr edit "$BRANCH" --body-file /tmp/body.md
+          else
+            gh pr create --head "$BRANCH" --base main --title "Horário: horários novos da escola" --body-file /tmp/body.md
+          fi
+
+      # Administração → Estado dos dados (never fails the run)
+      - name: Data status
+        if: ${{ !cancelled() }}
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          ESTADO_PROJECTS: ${{ secrets.SUPABASE_PROJECT_ID }},${{ secrets.SUPABASE_STAGING_PROJECT_ID }}
+        run: node scripts/estado-dados/registar.mjs horarios ${{ job.status }} /tmp/horario.md
+
+      - name: Keep the schedule on
+        if: ${{ !cancelled() && github.event_name == 'schedule' }}
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh api -X PUT "repos/${{ github.repository }}/actions/workflows/horario.yml/enable"
+
+  changes:
+    name: Mudanças nos horários
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '11 7-17/2 * * 1-5'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          repository: uRyumasu/esap-plus
+          token: ${{ secrets.ESAP_PLUS_TOKEN }}
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Save the changes and notify the classes
+        env:
+          SUPABASE_ACCESS_TOKEN: ${{ secrets.SUPABASE_ACCESS_TOKEN }}
+          HORARIO_PROJECTS: ${{ secrets.SUPABASE_PROJECT_ID }},${{ secrets.SUPABASE_STAGING_PROJECT_ID }}
+        run: python3 scripts/horario/mudancas.py > /dev/null
